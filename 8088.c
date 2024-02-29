@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include "8088.h"
 #include "mainBoard.h"
+#include "dbgapi.h"
+#include "list.h"
 
 void push(P8088* p8088, unsigned value);
 unsigned int pop(P8088* p8088);
@@ -11,7 +13,7 @@ void port_write_x86(P8088* p8088, unsigned int address, unsigned char data);
 unsigned int port_read_x86(P8088* p8088, unsigned int address);
 void prefetch_flush(P8088* p8088);
 unsigned int fetch_x86(P8088* p8088);
-void trap(P8088* p8088, unsigned int number);
+void trap(P8088* p8088, unsigned int number, int maskable);
 void reset8088(P8088* p8088);
 void undefined_instruction(P8088* p8088, int opcode);
 void decode_ea(P8088* p8088);
@@ -28,6 +30,7 @@ unsigned int seg(P8088* p8088, unsigned int defaultseg);
 P8088* new8088()
 {
 	P8088* cpu = (P8088*)malloc(sizeof(P8088));
+	cpu->intr_queue = NULL;
 	return cpu;
 }
 
@@ -46,6 +49,7 @@ void memory_write_x86(P8088* p8088, unsigned int address, unsigned char data)
 	// p8088->memory[address]=data&0xff;
 	// p8088->memory[address]=data;
 	// printf("%s %X %X\n", "Memory write function called", address, data);
+	bp_write_check(address);
 }
 
 unsigned int memory_read_x86(P8088* p8088, unsigned int address)
@@ -55,6 +59,7 @@ unsigned int memory_read_x86(P8088* p8088, unsigned int address)
 	// return p8088->memory[address]&0xff;
 	// return p8088->memory[address];
 	// printf("%s %X\n", "Memory read function called", address);
+	bp_read_check(address);
 }
 
 void port_write_x86(P8088* p8088, unsigned int address, unsigned char data)
@@ -62,6 +67,7 @@ void port_write_x86(P8088* p8088, unsigned int address, unsigned char data)
 	// call mainboard port write function -
 	p8088->port_write_x86(address,data&0xff);
 	// z100_port_write(address,data);
+	bp_out_check(address);
 }
 
 unsigned int port_read_x86(P8088* p8088, unsigned int address)
@@ -70,6 +76,7 @@ unsigned int port_read_x86(P8088* p8088, unsigned int address)
 	return p8088->port_read_x86(address);
 	// return 0;
 	// return z100_port_read(address);
+	bp_in_check(address);
 }
 
 void prefetch_flush(P8088* p8088)
@@ -90,7 +97,7 @@ unsigned int fetch_x86(P8088* p8088)
 	return f;
 }
 
-void trap(P8088* p8088, unsigned int number)
+void trap(P8088* p8088, unsigned int number, int maskable)
 {
 	// printf("%s\n", "** INTERRUPT SENT TO 8088 TRAP **");
 	unsigned int flags=(p8088->o<<11)|(p8088->d<<10)|(p8088->i<<9)|(p8088->t<<8)|(p8088->s<<7)|(p8088->z<<6)|(p8088->ac<<4)|(p8088->p<<2)|(p8088->c<<0);
@@ -98,13 +105,39 @@ void trap(P8088* p8088, unsigned int number)
 	unsigned int ip=p8088->IP;
 	flags|=0xf002;
 
-	if(p8088->enable_interrupts==0)
+	if(number == -1U) {
+		if(p8088->enable_interrupts && list_size(p8088->intr_queue)) {
+			number = list_remove(p8088->intr_queue,0);
+			goto dointr;
+		} else {
+			return;
+		}
+	}
+
+	// ss change, delay intr by one instruction
+	if(p8088->enable_interrupts==0) {
+		if (p8088->i!=0 || !maskable)
+			list_add(p8088->intr_queue,number);
 		return;
+	}
 //	if(p8088->t==0)
 //		return;
-	if(p8088->i==0)
-		return;
+	if(p8088->i==0 && maskable) {
+		out_error("IF = 0, not doing INT %X.\n", number);
+		if(list_size(p8088->intr_queue)) {
+			number = list_remove(p8088->intr_queue,0);
+			goto dointr;
+		} else {
+			return;
+		}
+	}
 
+	if(list_size(p8088->intr_queue)) {
+		list_add(p8088->intr_queue,number);
+		number = list_remove(p8088->intr_queue,0);
+	}
+
+dointr:
 	p8088->IP=memory_read_x86(p8088,(number&0xff)<<2);
 	p8088->IP|=memory_read_x86(p8088,((number&0xff)<<2)+1)<<8;
 	p8088->CS=memory_read_x86(p8088,((number&0xff)<<2)+2);
@@ -128,7 +161,9 @@ void reset8088(P8088* p8088)
 	p8088->name_opcode="";
 	p8088->ready_x86_=0;
 	p8088->wait_state_x86=0;
+	p8088->intr_queue=new(uint_list);
 	prefetch_flush(p8088);
+	breakpoint_active = 1;
 }
 
 unsigned int modrm, ea, mod, rm, disp, ea, eaUsesStack;
@@ -139,7 +174,8 @@ int enable_interrupt=1;
 
 void undefined_instruction(P8088* p8088, int opcode)
 {
-	printf("UNDEFINED INSTRUCTION %x\n",opcode);
+	out_error("UNDEFINED INSTRUCTION %x, CS:IP=%04X:%04X\n",opcode, p8088->CS, p8088->IP);
+	breakpoint_active = 1;
 //	trap(p8088,6);
 	cycles+=50;
 }
@@ -1945,6 +1981,7 @@ void doInstruction8088(P8088* p8088)
 
 		//add,or,adc,sbb,and,sub,xor,cmp r/m8, imm8
 		case 0x80:
+op80:
 			decode_ea(p8088);
 			value1=decode_rm_8(p8088);
 			value2=fetch_x86(p8088);
@@ -2073,6 +2110,10 @@ void doInstruction8088(P8088* p8088)
 				break;
 			}
 			break;
+
+		//same as 0x80, used by early 8086 assemblers
+		case 0x82:
+			goto op80;
 
 		//add,or,adc,sbb,and,sub,xor,cmp r/m16, imm8
 		case 0x83:
@@ -3067,7 +3108,7 @@ void doInstruction8088(P8088* p8088)
 
 		//int 3
 		case 0xcc:
-			trap(p8088,3);
+			trap(p8088,3,0);
 			prefetch_flush(p8088);
 			cycles+=52;
 			name_opcode="int 3";
@@ -3076,7 +3117,7 @@ void doInstruction8088(P8088* p8088)
 		//int imm8
 		case 0xcd:
 			result=fetch_x86(p8088);
-			trap(p8088,result);
+			trap(p8088,result,0);
 			prefetch_flush(p8088);
 			cycles+=51;
 			name_opcode="int imm8";
@@ -3086,7 +3127,7 @@ void doInstruction8088(P8088* p8088)
 		case 0xce:
 			if(p8088->o)
 			{
-				trap(p8088,4);
+				trap(p8088,4,0);
 				prefetch_flush(p8088);
 				cycles+=53;
 			}
@@ -3425,7 +3466,7 @@ void doInstruction8088(P8088* p8088)
 			value2=fetch_x86(p8088);
 			if(value2==0)
 			{
-				trap(p8088,0);
+				trap(p8088,0,0);
 				break;
 			}
 			value1=p8088->AL;
@@ -3761,7 +3802,7 @@ void doInstruction8088(P8088* p8088)
 				if(value2==0)
 				{
 					cycles+=(mod==3)? 16:20;
-					trap(p8088,0);
+					trap(p8088,0,0);
 					break;
 				}
 				result=(p8088->AH<<8)|p8088->AL;
@@ -3769,7 +3810,7 @@ void doInstruction8088(P8088* p8088)
 				if((result&0xff00)!=0)
 				{
 					cycles+=(mod==3)? 16:20;
-					trap(p8088,0);
+					trap(p8088,0,0);
 					break;
 				}
 				value1=(p8088->AH<<8)|p8088->AL;
@@ -3791,7 +3832,7 @@ void doInstruction8088(P8088* p8088)
 				if(value2==0)
 				{
 					cycles+=(mod==3)? 16:20;
-					trap(p8088,0);
+					trap(p8088,0,0);
 					break;
 				}
 				sign1=(value1&0x8000)!=0? 1:0;
@@ -3807,7 +3848,7 @@ void doInstruction8088(P8088* p8088)
 					if(r1>0x80)
 					{
 						cycles+=(mod==3)? 16:20;
-						trap(p8088,0);
+						trap(p8088,0,0);
 						break;
 					}
 					r1=(~r1+1)&0xff;
@@ -3817,7 +3858,7 @@ void doInstruction8088(P8088* p8088)
 					if(r1>0x7f)
 					{
 						cycles+=(mod==3)? 16:20;
-						trap(p8088,0);
+						trap(p8088,0,0);
 						break;
 					}
 				}
@@ -3918,7 +3959,7 @@ void doInstruction8088(P8088* p8088)
 				if(v2==0)
 				{
 					cycles+=(mod==3)? 16:20;
-					trap(p8088,0);
+					trap(p8088,0,0);
 					break;
 				}
 				v1=(p8088->DH<<24)|(p8088->DL<<16)|(p8088->AH<<8)|p8088->AL;
@@ -3926,7 +3967,7 @@ void doInstruction8088(P8088* p8088)
 				if((r&0xffff0000)!=0)
 				{
 					cycles+=(mod==3)? 16:20;
-					trap(p8088,0);
+					trap(p8088,0,0);
 					break;
 				}
 				p8088->DL = (v1 % v2)&0xff;
@@ -3951,7 +3992,7 @@ void doInstruction8088(P8088* p8088)
 				if(v2==0)
 				{
 					cycles+=(mod==3)? 16:20;
-					trap(p8088,0);
+					trap(p8088,0,0);
 					break;
 				}
 				sign1=(value1&0x80000000)!=0? 1:0;
@@ -3967,7 +4008,7 @@ void doInstruction8088(P8088* p8088)
 					if(r1>0x8000)
 					{
 						cycles+=(mod==3)? 16:20;
-						trap(p8088,0);
+						trap(p8088,0,0);
 						break;
 					}
 					r1=(~r1+1)&0xffff;
@@ -3977,7 +4018,7 @@ void doInstruction8088(P8088* p8088)
 					if(r1>0x7fff)
 					{
 						cycles+=(mod==3)? 16:20;
-						trap(p8088,0);
+						trap(p8088,0,0);
 						break;
 					}
 				}
@@ -4195,4 +4236,5 @@ void doInstruction8088(P8088* p8088)
 	p8088->op_result=result;
 	p8088->cycles=cycles;
 	p8088->name_opcode=name_opcode;
+	trap(p8088, -1U, 1);
 }

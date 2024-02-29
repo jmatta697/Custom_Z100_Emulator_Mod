@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <signal.h>
 #include <gtk/gtk.h>
 #include "debug_gui.h"
 #include "8085.h"
@@ -20,6 +21,7 @@
 #include "video.h"
 #include "screen.h"
 #include "utility_functions.h"
+#include "dbgapi.h"
 
 #define ROM_SIZE 0x4000
 #define RAM_SIZE 0x30000
@@ -57,6 +59,7 @@ int zeroParity;
 int byteParity;
 char debug_mode;
 int debug_mode_2_active;
+volatile sig_atomic_t breakpoint_active;
 bool reset_irq6;
 unsigned char user_debug_mode_choice;
 unsigned char switch_s101_FF;
@@ -110,6 +113,52 @@ void handleDebugOutput();
 void fD1797DebugOutput();
 
 void loadimage();
+
+void ctrlC(int) {
+	breakpoint_active = 1;
+}
+
+void cpu_op(void) {
+    // if active processor is the 8085
+    if(active_processor == pr8085) {
+			handle8085InstructionCycle();
+    }
+    // if the active processor is the 8088
+    else if(active_processor == pr8088) {
+			handle8088InstructionCycle();
+		}
+
+		// calculate virtual time passed with the last instruction execution
+		updateElapsedVirtualTime();
+
+    /* simulate VSYNC interrupt on I6 (keyboard video display and light pen int)
+			roughly every 10,000 instructions - This satisfies BIOS diagnostics,
+			but the interrupt routine is not used to update the Z-100 display
+		*/
+    simulateVSYNCInterrupt();
+
+    /* clock the 8253 timer - this should be ~ every 4 microseconds
+		 - according to page 2.80 of Z-100 technical manual, the timer is
+		 clocked by a 250kHz clock (every 20 cycles of the 5 Mhz main clock)
+		 The e8253 timer is incremented based on the last instruction cycle count.
+		*/
+		handle8253TimerClockCycle();
+
+		/* cycle the JWD1797. The JWD1797 is driven by a 1 MHz clock in the Z-100.
+			Thus, it should be cycled every 1 microsecond or every five CPU (5 MHz)
+			cycles. Instead, time slices added to the internal JWD1797 timer
+			mechanisms will be determined by how many cycles the previous instruction
+			took.
+		*/
+		doJWD1797Cycle(jwd1797, last_instruction_time_us);
+
+    // update the screen every 100,000 instructions
+    updateZ100Screen();
+
+    // update_debug_gui_values();
+
+}
+
 
 /*
  ============== MAIN Z100 FUNCTION ==============
@@ -212,6 +261,7 @@ int z100_main() {
 	debug_timer2 = 0x00;
 	debug_int6 = 0x00;
 	tkp_debug = 0;
+	dbg_init();
   /*
 	 >>>> RUN THE PROCESSORS <<<<
 	*/
@@ -220,47 +270,9 @@ int z100_main() {
   while(1) {
 		// check if instruction pointer (IP) has been reached for dubug mode 2
 		handleDebug2Mode();
-    // if active processor is the 8085
-    if(active_processor == pr8085) {
-			handle8085InstructionCycle();
-    }
-    // if the active processor is the 8088
-    else if(active_processor == pr8088) {
-			handle8088InstructionCycle();
-		}
-
-		// calculate virtual time passed with the last instruction execution
-		updateElapsedVirtualTime();
-
-    /* simulate VSYNC interrupt on I6 (keyboard video display and light pen int)
-			roughly every 10,000 instructions - This satisfies BIOS diagnostics,
-			but the interrupt routine is not used to update the Z-100 display
-		*/
-    simulateVSYNCInterrupt();
-
-    /* clock the 8253 timer - this should be ~ every 4 microseconds
-		 - according to page 2.80 of Z-100 technical manual, the timer is
-		 clocked by a 250kHz clock (every 20 cycles of the 5 Mhz main clock)
-		 The e8253 timer is incremented based on the last instruction cycle count.
-		*/
-		handle8253TimerClockCycle();
-
-		/* cycle the JWD1797. The JWD1797 is driven by a 1 MHz clock in the Z-100.
-			Thus, it should be cycled every 1 microsecond or every five CPU (5 MHz)
-			cycles. Instead, time slices added to the internal JWD1797 timer
-			mechanisms will be determined by how many cycles the previous instruction
-			took.
-		*/
-		doJWD1797Cycle(jwd1797, last_instruction_time_us);
-
-    // update the screen every 100,000 instructions
-    updateZ100Screen();
-
-    // update_debug_gui_values();
-
-    /* if debug mode is active, wait for enter key to continue after each
-    instruction */
+    /* if debug mode is active, wait for 'g' command */
 		handleDebugOutput();
+		cpu_op();
 
 		if(instructions_done == 1797613) {
 			// loadimage();
@@ -280,7 +292,7 @@ void interruptFunctionCall(void* v, int number) {
     return;
   }
   int irq = e8259_inta(e8259_master, e8259_slave);
-  trap(p8088, irq);
+  trap(p8088, irq, 1);
 }
 
 void cascadeInterruptFunctionCall(void* v, int number) {
@@ -358,6 +370,8 @@ int pr8088_FD1797WaitStateCondition(unsigned char opCode, unsigned char port_num
 }
 
 void handleDebug2Mode() {
+
+	bp_exec_check(((p8088->CS<<4)+p8088->IP)&0xfffff);
 
 	if(debug_mode == '2') {
 		if((active_processor == pr8085) && (p8085.PC == breakAtInstruction)) {
@@ -477,7 +491,7 @@ void handle8088InstructionCycle() {
 	instruction took */
 	// cycles_done = cycles_done + p8088->cycles;
 	// only print processor status if debug conditions are met
-	if((debug_mode == '1' && (instructions_done >= breakAtInstruction)) ||
+	/*if((debug_mode == '1' && (instructions_done >= breakAtInstruction)) ||
 		(debug_mode_2_active == 1)) {
 		printf("IP = %X, opcode = %X, inst = %s\n",
 			p8088->IP,p8088->opcode,p8088->name_opcode);
@@ -493,7 +507,7 @@ void handle8088InstructionCycle() {
 			p8088->c,p8088->p,p8088->ac,p8088->z,p8088->s);
 		printf("trap = %X, int = %X, dir = %X, overflow = %X\n",
 			p8088->t,p8088->i,p8088->d,p8088->o);
-	}
+	}*/
 }
 
 void updateElapsedVirtualTime() {
@@ -549,15 +563,60 @@ void updateZ100Screen() {
 	}
 }
 
+char *inputLine(void) {
+	int c;
+	char *result = NULL;
+	int i = 0;
+	while (1) {
+		c = fgetc(stdin);
+		if (c == EOF || c == '\n') {
+			break;
+		}
+		result = (char *)realloc(result, i+1);
+		result[i] = (char)c;
+		i++;
+	}
+	if (c == '\n' || i > 0) {
+		result = (char *)realloc(result, i+1);
+		result[i] = '\0';
+	}
+	return result;
+}
+
 void handleDebugOutput() {
 	if((debug_mode == '1' && (instructions_done >= breakAtInstruction)) ||
-		(debug_mode_2_active == 1)) {
+		(debug_mode_2_active == 1) || (breakpoint_active == 1)) {
 		printf("instructions done: %ld\n", instructions_done);
 		printf("%s%f\n", "last instruction time (us): ", last_instruction_time_us);
 		printf("TOTAL TIME ELAPSED (us): %f\n", total_time_elapsed);
 		// fD1797DebugOutput();
 
-		while(getchar() != '\n') {};
+		// reg dump
+		dbg_reg(p8088);
+
+		char *last = strdup("r");
+
+		printf(">");
+		char *inpline = inputLine();
+		while (*inpline != 'g') {
+			if (*inpline == '\0') {
+				free(inpline);
+				inpline = strdup(last);
+			} else {
+				free(last);
+				last = strdup(inpline);
+			}
+			if (!dbg_cmd(p8088,inpline)) {
+				printf("Bad command.\n");
+			}
+			free(inpline);
+			printf(">");
+			inpline = inputLine();
+		}
+		free(inpline);
+		free(last);
+		debug_mode_2_active = 0;
+		breakpoint_active = 0;
 	}
 }
 
@@ -608,6 +667,10 @@ void* mainBoardThread(void* arg) {
 
 // MAIN FUNCTION - ENTRY
 int main(int argc, char* argv[]) {
+
+	struct sigaction act;
+	act.sa_handler = ctrlC;
+	sigaction(SIGINT, &act, NULL);
 
 	printf("\n\n%s\n\n",
 		" ===================================\n"
