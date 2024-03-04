@@ -1,10 +1,10 @@
-jz100 : mainBoard.o 8085.o 8088.o e8259.o e8253.o jwd1797.o keyboard.o video.o screen.o debug_gui.o utility_functions.o
-	gcc -pthread -o jz100 mainBoard.o 8085.o 8088.o e8259.o e8253.o jwd1797.o keyboard.o video.o screen.o debug_gui.o utility_functions.o `pkg-config --cflags --libs gtk+-3.0` -export-dynamic
-mainBoard.o : mainBoard.c mainBoard.h 8085.h 8088.h e8259.h e8253.h jwd1797.h keyboard.h video.h screen.h debug_gui.h utility_functions.h
+jz100 : mainBoard.o 8085.o 8088.o e8259.o e8253.o jwd1797.o keyboard.o video.o screen.o debug_gui.o utility_functions.o dbgapi.o
+	gcc -pthread -o jz100 mainBoard.o 8085.o 8088.o e8259.o e8253.o jwd1797.o keyboard.o video.o screen.o debug_gui.o utility_functions.o dbgapi.o `pkg-config --cflags --libs gtk+-3.0` -export-dynamic
+mainBoard.o : mainBoard.c mainBoard.h 8085.h 8088.h e8259.h e8253.h jwd1797.h keyboard.h video.h screen.h debug_gui.h utility_functions.h dbgapi.h
 	gcc -c mainBoard.c `pkg-config --cflags --libs gtk+-3.0` -export-dynamic
 8085.o : 8085.c 8085.h mainBoard.h
 	gcc -c 8085.c
-8088.o : 8088.c 8088.h mainBoard.h
+8088.o : 8088.c 8088.h mainBoard.h dbgapi.h list.h
 	gcc -c 8088.c
 e8259.o : e8259.c e8259.h
 	gcc -c e8259.c
@@ -22,8 +22,10 @@ debug_gui.o : debug_gui.c 8085.h debug_gui.h
 	gcc -c debug_gui.c `pkg-config --cflags --libs gtk+-3.0` -export-dynamic
 utility_functions.o : utility_functions.c
 	gcc -c utility_functions.c
+dbgapi.o : dbgapi.c dbgapi.h
+	gcc -c dbgapi.c
 clean :
-	rm jz100 mainBoard.o 8085.o 8088.o e8259.o e8253.o jwd1797.o keyboard.o debug_gui.o utility_functions.o video.o screen.o
+	rm jz100 mainBoard.o 8085.o 8088.o e8259.o e8253.o jwd1797.o keyboard.o debug_gui.o utility_functions.o video.o screen.o dbgapi.o
 
 # The make lines below is a replica of the above lines except they
 # include the jumper compilation

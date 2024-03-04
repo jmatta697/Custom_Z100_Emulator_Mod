@@ -1,4 +1,10 @@
+#ifndef P8088_H
+#define P8088_H
+
+#include "list.h"
+
 #define PREFETCH_SIZE 4
+import_list(unsigned int, uint_list);
 typedef void (*store_function) (unsigned int addr, unsigned char val);
 typedef unsigned int (*load_function) (unsigned int addr);
 
@@ -17,6 +23,7 @@ typedef struct
 	unsigned int opcode, value, operand1, operand2, immediate, cycles;
 	int op_result;
 	char* name_opcode;
+	uint_list intr_queue;
 
 	unsigned char* memory;
 
@@ -36,7 +43,10 @@ typedef struct
 P8088* new8088();
 void doInstruction8088(P8088*);
 void reset8088(P8088*);
-void trap(P8088*,unsigned int);
+void trap(P8088*,unsigned int,int);
 void prefetch_flush(P8088*);
 
 void assignCallbacks8088(P8088*,load_function,store_function,load_function,store_function);
+void out_error(const char *format, ...);
+
+#endif /* P8088_H */
